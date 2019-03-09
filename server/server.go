@@ -280,6 +280,17 @@ func (cs *channelStore) get(name string) *channel {
 	return c
 }
 
+func (cs *channelStore) getIfNotAboutToBeDeleted(name string) *channel {
+	cs.RLock()
+	c := cs.channels[name]
+	if c != nil && c.activity != nil && c.activity.deleteInProgress {
+		cs.RUnlock()
+		return nil
+	}
+	cs.RUnlock()
+	return c
+}
+
 func (cs *channelStore) createChannel(s *StanServer, name string) (*channel, error) {
 	cs.Lock()
 	c, err := cs.createChannelLocked(s, name)
@@ -308,15 +319,8 @@ func (cs *channelStore) createChannelLocked(s *StanServer, name string) (*channe
 		return nil, err
 	}
 	isStandaloneOrLeader := true
-	if s.isClustered {
-		if s.isLeader() {
-			if err := c.subToSnapshotRestoreRequests(); err != nil {
-				delete(cs.channels, name)
-				return nil, err
-			}
-		} else {
-			isStandaloneOrLeader = false
-		}
+	if s.isClustered && !s.isLeader() {
+		isStandaloneOrLeader = false
 	}
 	if isStandaloneOrLeader && c.activity != nil {
 		c.startDeleteTimer()
@@ -415,7 +419,6 @@ type channel struct {
 	store        *stores.Channel
 	ss           *subStore
 	lTimestamp   int64
-	snapshotSub  *nats.Subscription
 	stan         *StanServer
 	activity     *channelActivity
 }
@@ -451,7 +454,7 @@ func (c *channel) stopDeleteTimer() {
 
 // Resets the delete timer to the given duration.
 // If the timer was not created, this call will create it.
-// The channelStore's delMu mutex must be held on entry.
+// The channelStore's mutex must be held on entry.
 func (c *channel) resetDeleteTimer(newDuration time.Duration) {
 	a := c.activity
 	if a.timer == nil {
@@ -485,15 +488,22 @@ func (c *channel) pubMsgToMsgProto(pm *pb.PubMsg, seq uint64) *pb.MsgProto {
 }
 
 // Sets a subscription that will handle snapshot restore requests from followers.
-func (c *channel) subToSnapshotRestoreRequests() error {
+func (s *StanServer) subToSnapshotRestoreRequests() error {
 	var (
-		msgBuf              []byte
-		buf                 []byte
-		snapshotRestoreSubj = fmt.Sprintf("%s.%s.%s", defaultSnapshotPrefix, c.stan.info.ClusterID, c.name)
+		msgBuf                []byte
+		buf                   []byte
+		snapshotRestorePrefix = fmt.Sprintf("%s.%s.", defaultSnapshotPrefix, s.info.ClusterID)
+		prefixLen             = len(snapshotRestorePrefix)
 	)
-	sub, err := c.stan.ncsr.Subscribe(snapshotRestoreSubj, func(m *nats.Msg) {
+	sub, err := s.ncsr.Subscribe(snapshotRestorePrefix+">", func(m *nats.Msg) {
 		if len(m.Data) != 16 {
-			c.stan.log.Errorf("Invalid snapshot request, data len=%v", len(m.Data))
+			s.log.Errorf("Invalid snapshot request, data len=%v", len(m.Data))
+			return
+		}
+		cname := m.Subject[prefixLen:]
+		c := s.channels.getIfNotAboutToBeDeleted(cname)
+		if c == nil {
+			s.ncsr.Publish(m.Reply, nil)
 			return
 		}
 		start := util.ByteOrder.Uint64(m.Data[:8])
@@ -502,7 +512,7 @@ func (c *channel) subToSnapshotRestoreRequests() error {
 		for seq := start; seq <= end; seq++ {
 			msg, err := c.store.Msgs.Lookup(seq)
 			if err != nil {
-				c.stan.log.Errorf("Snapshot restore request error for channel %q, error looking up message %v: %v", c.name, seq, err)
+				s.log.Errorf("Snapshot restore request error for channel %q, error looking up message %v: %v", c.name, seq, err)
 				return
 			}
 			if msg == nil {
@@ -517,14 +527,14 @@ func (c *channel) subToSnapshotRestoreRequests() error {
 				}
 				buf = msgBuf[:n]
 			}
-			if err := c.stan.ncsr.Publish(m.Reply, buf); err != nil {
-				c.stan.log.Errorf("Snapshot restore request error for channel %q, unable to send response for seq %v: %v", c.name, seq, err)
+			if err := s.ncsr.Publish(m.Reply, buf); err != nil {
+				s.log.Errorf("Snapshot restore request error for channel %q, unable to send response for seq %v: %v", c.name, seq, err)
 			}
 			if buf == nil {
 				return
 			}
 			select {
-			case <-c.stan.shutdownCh:
+			case <-s.shutdownCh:
 				return
 			default:
 			}
@@ -533,8 +543,8 @@ func (c *channel) subToSnapshotRestoreRequests() error {
 	if err != nil {
 		return err
 	}
-	c.snapshotSub = sub
-	c.snapshotSub.SetPendingLimits(-1, -1)
+	sub.SetPendingLimits(-1, -1)
+	s.snapReqSub = sub
 	return nil
 }
 
@@ -630,6 +640,7 @@ type StanServer struct {
 	raftLogging bool
 	isClustered bool
 	lazyRepl    *lazyReplication
+	snapReqSub  *nats.Subscription
 
 	// Our internal subscriptions
 	connectSub  *nats.Subscription
@@ -1924,6 +1935,11 @@ func (s *StanServer) leadershipAcquired() error {
 	// Then, we will notify it back to unlock it when were are done here.
 	defer close(sdc)
 
+	// Start listening to snapshot restore requests here...
+	if err := s.subToSnapshotRestoreRequests(); err != nil {
+		return err
+	}
+
 	// Use a barrier to ensure all preceding operations are applied to the FSM
 	if err := s.raft.Barrier(0).Error(); err != nil {
 		return err
@@ -1962,10 +1978,6 @@ func (s *StanServer) leadershipAcquired() error {
 
 	var allSubs []*subState
 	for _, c := range channels {
-		// Subscribe to channel snapshot restore subject
-		if err := c.subToSnapshotRestoreRequests(); err != nil {
-			return err
-		}
 		subs := c.ss.getAllSubs()
 		if len(subs) > 0 {
 			allSubs = append(allSubs, subs...)
@@ -2017,10 +2029,6 @@ func (s *StanServer) leadershipLost() {
 	// Unsubscribe to the snapshot request per channel since we are no longer
 	// leader.
 	for _, c := range s.channels.getAll() {
-		if c.snapshotSub != nil {
-			c.snapshotSub.Unsubscribe()
-			c.snapshotSub = nil
-		}
 		if c.activity != nil {
 			s.channels.stopDeleteTimer(c)
 		}
@@ -2499,6 +2507,10 @@ func (s *StanServer) unsubscribeInternalSubs() {
 		s.cliPingSub.Unsubscribe()
 		s.cliPingSub = nil
 	}
+	if s.snapReqSub != nil {
+		s.snapReqSub.Unsubscribe()
+		s.snapReqSub = nil
+	}
 }
 
 func (s *StanServer) createSub(subj string, f nats.MsgHandler, errTxt string) (*nats.Subscription, error) {
@@ -2712,12 +2724,6 @@ func (s *StanServer) processDeleteChannel(channel string) {
 			c.startDeleteTimer()
 		}
 		return
-	}
-	// If there was a subscription for snapshots requests,
-	// we need to unsubscribe.
-	if c.snapshotSub != nil {
-		c.snapshotSub.Unsubscribe()
-		c.snapshotSub = nil
 	}
 	delete(s.channels.channels, channel)
 	s.log.Noticef("Channel %q has been deleted", channel)
